@@ -38,17 +38,20 @@ class F95ZoneCrawler:
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
+        
+        # Add cookies for authentication if provided
+        if 'cookies' in self.config:
+            for cookie in self.config['cookies']:
+                self.session.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain', 'f95zone.to'))
+        
+        # Cache for checking duplicates
+        self.existing_thread_ids = self.get_existing_thread_ids()
     
     def clean_thread_url(self, url):
         """Remove /unread suffix from thread URLs"""
         if url.endswith('/unread'):
             return url[:-7]  # Remove last 7 characters ('/unread')
         return url
-        
-        # Add cookies for authentication if provided
-        if 'cookies' in self.config:
-            for cookie in self.config['cookies']:
-                self.session.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain', 'f95zone.to'))
         
         # Cache for checking duplicates
         self.existing_thread_ids = self.get_existing_thread_ids()
