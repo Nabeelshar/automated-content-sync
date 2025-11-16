@@ -38,6 +38,12 @@ class F95ZoneCrawler:
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
+    
+    def clean_thread_url(self, url):
+        """Remove /unread suffix from thread URLs"""
+        if url.endswith('/unread'):
+            return url[:-7]  # Remove last 7 characters ('/unread')
+        return url
         
         # Add cookies for authentication if provided
         if 'cookies' in self.config:
@@ -128,6 +134,7 @@ class F95ZoneCrawler:
                     continue
                 
                 thread_url = urljoin(self.base_url, title_elem.get('href', ''))
+                thread_url = self.clean_thread_url(thread_url)  # Remove /unread suffix
                 title = title_elem.text.strip()
                 
                 # Extract thread ID from URL
