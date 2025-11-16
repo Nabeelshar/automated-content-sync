@@ -504,8 +504,8 @@ class F95ZoneCrawler:
             logger.error(f"Error parsing thread page: {e}")
             return None
     
-    def send_to_wordpress(self, game_data):
-        """Send game data to WordPress via REST API"""
+    def send_to_wordpress(self, game_data, max_retries=3):
+        """Send game data to WordPress via REST API with retry logic"""
         api_url = self.config['wordpress_api_url']
         api_key = self.config['wordpress_api_key']
         
@@ -514,27 +514,37 @@ class F95ZoneCrawler:
             'X-API-Key': api_key
         }
         
-        try:
-            response = requests.post(api_url, json=game_data, headers=headers, timeout=30)
-            response.raise_for_status()
-            
-            result = response.json()
-            logger.info(f"Successfully sent: {game_data['title']} - Post ID: {result.get('post_id')}")
-            
-            # Add to cache
-            if game_data.get('thread_id'):
-                self.existing_thread_ids.add(game_data['thread_id'])
-            
-            return result
-            
-        except requests.RequestException as e:
-            logger.error(f"Failed to send to WordPress: {e}")
-            if hasattr(e.response, 'text'):
-                logger.error(f"Response: {e.response.text}")
-            return None
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(api_url, json=game_data, headers=headers, timeout=30)
+                response.raise_for_status()
+                
+                result = response.json()
+                logger.info(f"Successfully sent: {game_data['title']} - Post ID: {result.get('post_id')}")
+                
+                # Add to cache
+                if game_data.get('thread_id'):
+                    self.existing_thread_ids.add(game_data['thread_id'])
+                
+                return result
+                
+            except requests.RequestException as e:
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                
+                if attempt < max_retries - 1:
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for {game_data['title']}: {e}")
+                    if hasattr(e, 'response') and e.response is not None:
+                        logger.warning(f"Response: {e.response.text[:200]}")
+                    logger.info(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Failed to send to WordPress after {max_retries} attempts: {e}")
+                    if hasattr(e, 'response') and e.response is not None:
+                        logger.error(f"Response: {e.response.text[:200]}")
+                    return None
     
-    def send_batch_to_wordpress(self, batch_data):
-        """Send multiple games to WordPress in one request"""
+    def send_batch_to_wordpress(self, batch_data, max_retries=3):
+        """Send multiple games to WordPress in one request with retry logic"""
         api_url = self.config['wordpress_api_url'].replace('/create-post', '/create-batch')
         api_key = self.config['wordpress_api_key']
         
@@ -543,31 +553,40 @@ class F95ZoneCrawler:
             'X-API-Key': api_key
         }
         
-        try:
-            response = requests.post(api_url, json={'posts': batch_data}, headers=headers, timeout=60)
-            response.raise_for_status()
-            
-            result = response.json()
-            created = result.get('created', 0)
-            skipped = result.get('skipped', 0)
-            
-            logger.info(f"Batch sent: {created} created, {skipped} skipped")
-            
-            # Add to cache
-            for game in batch_data:
-                if game.get('thread_id'):
-                    self.existing_thread_ids.add(game['thread_id'])
-            
-            return result
-            
-        except requests.RequestException as e:
-            logger.warning(f"Batch send failed, falling back to individual sends: {e}")
-            # Fallback to individual sends
-            success = 0
-            for game_data in batch_data:
-                if self.send_to_wordpress(game_data):
-                    success += 1
-            return {'created': success, 'skipped': 0}
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(api_url, json={'posts': batch_data}, headers=headers, timeout=60)
+                response.raise_for_status()
+                
+                result = response.json()
+                created = result.get('created', 0)
+                skipped = result.get('skipped', 0)
+                
+                logger.info(f"Batch sent: {created} created, {skipped} skipped")
+                
+                # Add to cache
+                for game in batch_data:
+                    if game.get('thread_id'):
+                        self.existing_thread_ids.add(game['thread_id'])
+                
+                return result
+                
+            except requests.RequestException as e:
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                
+                if attempt < max_retries - 1:
+                    logger.warning(f"Batch send attempt {attempt + 1}/{max_retries} failed: {e}")
+                    logger.info(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    logger.warning(f"Batch send failed after {max_retries} attempts, falling back to individual sends: {e}")
+                    # Fallback to individual sends with delay
+                    success = 0
+                    for game_data in batch_data:
+                        if self.send_to_wordpress(game_data):
+                            success += 1
+                        time.sleep(2)  # 2 second delay between individual posts
+                    return {'created': success, 'skipped': 0}
     
     def crawl_category(self, max_pages=1, start_page=1):
         """Crawl category pages and extract thread listings"""
@@ -639,8 +658,8 @@ class F95ZoneCrawler:
                 
                 batch_data.append(game_data)
                 
-                # Be respectful to the server
-                time.sleep(self.config.get('delay_between_requests', 2))
+                # Be respectful to the server - 2 second delay between thread crawls
+                time.sleep(2)
             
             # Send batch to WordPress
             if batch_data:
