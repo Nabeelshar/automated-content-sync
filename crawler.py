@@ -656,24 +656,49 @@ class F95ZoneCrawler:
         logger.info(f"Completed: {success_count}/{total} threads successfully processed")
         return success_count
     
-    def run(self, max_pages=1, max_threads=None, batch_size=5):
-        """Main execution method"""
+    def run(self, max_pages=1, max_threads=None, batch_size=5, page_batch_size=10):
+        """Main execution method with batched page crawling"""
         logger.info("Starting F95Zone crawler")
-        logger.info(f"Crawling {max_pages} category page(s)")
+        logger.info(f"Crawling {max_pages} category page(s) in batches of {page_batch_size}")
         logger.info(f"Batch processing: {batch_size} threads per batch")
         
-        # Crawl category pages
-        threads = self.crawl_category(max_pages=max_pages)
-        logger.info(f"Total threads found: {len(threads)}")
+        total_processed = 0
+        remaining_threads = max_threads
         
-        if not threads:
-            logger.warning("No threads found, exiting")
-            return
+        # Process pages in batches (e.g., 10 pages at a time)
+        for page_start in range(1, max_pages + 1, page_batch_size):
+            page_end = min(page_start + page_batch_size - 1, max_pages)
+            pages_in_batch = page_end - page_start + 1
+            
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Processing page batch: pages {page_start}-{page_end}")
+            logger.info(f"{'='*60}\n")
+            
+            # Crawl this batch of category pages
+            threads = self.crawl_category(max_pages=pages_in_batch, start_page=page_start)
+            logger.info(f"Found {len(threads)} threads in pages {page_start}-{page_end}")
+            
+            if not threads:
+                logger.info(f"No more threads found, stopping at page {page_start}")
+                break
+            
+            # Crawl individual threads with batch processing
+            processed = self.crawl_threads(threads, max_threads=remaining_threads, batch_size=batch_size)
+            total_processed += processed
+            
+            # Update remaining thread limit
+            if remaining_threads is not None:
+                remaining_threads -= processed
+                if remaining_threads <= 0:
+                    logger.info(f"Reached max_threads limit ({max_threads}), stopping")
+                    break
+            
+            logger.info(f"Completed page batch {page_start}-{page_end}: {processed} threads processed")
+            logger.info(f"Total threads processed so far: {total_processed}\n")
         
-        # Crawl individual threads with batch processing
-        self.crawl_threads(threads, max_threads=max_threads, batch_size=batch_size)
-        
-        logger.info("Crawler completed")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Crawler completed - Total: {total_processed} threads processed")
+        logger.info(f"{'='*60}")
 
 
 def main():
@@ -689,7 +714,8 @@ def main():
     parser.add_argument('--config', default=default_config, help='Config file path')
     parser.add_argument('--pages', type=int, help='Number of category pages to crawl (default: infinite)')
     parser.add_argument('--max-threads', type=int, help='Maximum number of threads to process (default: all)')
-    parser.add_argument('--batch-size', type=int, default=10, help='Batch size for processing (default: 10)')
+    parser.add_argument('--batch-size', type=int, default=10, help='Batch size for processing threads (default: 10)')
+    parser.add_argument('--page-batch-size', type=int, default=10, help='Number of pages to crawl before processing (default: 10)')
     parser.add_argument('--infinite', action='store_true', help='Run continuously, crawling all pages')
     
     args = parser.parse_args()
@@ -698,7 +724,7 @@ def main():
     pages = args.pages if args.pages else (999999 if args.infinite or args.pages is None else 1)
     
     crawler = F95ZoneCrawler(config_file=args.config)
-    crawler.run(max_pages=pages, max_threads=args.max_threads, batch_size=args.batch_size)
+    crawler.run(max_pages=pages, max_threads=args.max_threads, batch_size=args.batch_size, page_batch_size=args.page_batch_size)
 
 
 if __name__ == '__main__':
