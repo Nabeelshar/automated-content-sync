@@ -583,10 +583,7 @@ class F95ZoneCrawler:
     
     def crawl_threads(self, threads, max_threads=None, batch_size=5):
         """Crawl individual thread pages with batch processing"""
-        if max_threads:
-            threads = threads[:max_threads]
-        
-        # Filter out already existing threads
+        # Filter out already existing threads FIRST
         threads_to_process = []
         skipped_count = 0
         
@@ -596,6 +593,9 @@ class F95ZoneCrawler:
                 skipped_count += 1
             else:
                 threads_to_process.append(thread)
+                # If max_threads specified, stop when we have enough NEW threads
+                if max_threads and len(threads_to_process) >= max_threads:
+                    break
         
         logger.info(f"Skipped {skipped_count} duplicates, processing {len(threads_to_process)} new threads")
         
