@@ -1,0 +1,94 @@
+name: F95Zone Crawler
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      pages:
+        description: 'Number of pages to crawl (leave empty for all)'
+        required: false
+        default: ''
+      max_threads:
+        description: 'Maximum threads to process (leave empty for all)'
+        required: false
+        default: ''
+      batch_size:
+        description: 'Batch size for processing'
+        required: false
+        default: '10'
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests beautifulsoup4 lxml
+        
+    - name: Create config file
+      run: |
+        cat > config.json << EOF
+        {
+          "wordpress_api_url": "${{ secrets.WORDPRESS_API_URL }}",
+          "wordpress_api_key": "${{ secrets.WORDPRESS_API_KEY }}",
+          "delay_between_requests": 2,
+          "cookies": [
+            {
+              "name": "xf_csrf",
+              "value": "${{ secrets.F95_CSRF_TOKEN }}",
+              "domain": "f95zone.to"
+            },
+            {
+              "name": "xf_session",
+              "value": "${{ secrets.F95_SESSION_TOKEN }}",
+              "domain": "f95zone.to"
+            },
+            {
+              "name": "xf_user",
+              "value": "${{ secrets.F95_USER_TOKEN }}",
+              "domain": "f95zone.to"
+            }
+          ]
+        }
+        EOF
+        
+    - name: Run crawler
+      run: |
+        if [ -n "${{ github.event.inputs.pages }}" ]; then
+          PAGES_ARG="--pages ${{ github.event.inputs.pages }}"
+        else
+          PAGES_ARG=""
+        fi
+        
+        if [ -n "${{ github.event.inputs.max_threads }}" ]; then
+          THREADS_ARG="--max-threads ${{ github.event.inputs.max_threads }}"
+        else
+          THREADS_ARG=""
+        fi
+        
+        BATCH_SIZE="${{ github.event.inputs.batch_size }}"
+        if [ -z "$BATCH_SIZE" ]; then
+          BATCH_SIZE="10"
+        fi
+        
+        python crawler.py $PAGES_ARG $THREADS_ARG --batch-size $BATCH_SIZE
+        
+    - name: Upload log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: crawler-log-${{ github.run_number }}
+        path: crawler.log
+        retention-days: 7
