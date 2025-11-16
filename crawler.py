@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
 F95Zone Game Crawler
-Crawls game data from F95Zone and creates WordPress posts via REST API
+Crawls game data from F95Zone forums and sends to WordPress via API
 """
-
-import json
-import logging
-import re
-import sys
-import time
-from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+import json
+import time
+import re
+import sys
+import os
+from datetime import datetime
+from urllib.parse import urljoin
+import logging
 
 # Setup logging
 logging.basicConfig(
@@ -20,32 +21,32 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('crawler.log'),
-        logging.StreamHandler()
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 
 
 class F95ZoneCrawler:
+    
     def __init__(self, config_file='config.json'):
+        """Initialize crawler with configuration"""
         self.config = self.load_config(config_file)
-        self.base_url = 'https://f95zone.to'
-        self.category_url = 'https://f95zone.to/forums/games.2/'
-        
-        # Setup session with cookies for authentication
+        self.base_url = "https://f95zone.to"
+        self.category_url = "https://f95zone.to/forums/games.2/"
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
         
-        # Set cookies from config
+        # Add cookies for authentication if provided
         if 'cookies' in self.config:
             for cookie in self.config['cookies']:
                 self.session.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain', 'f95zone.to'))
         
         # Cache for checking duplicates
         self.existing_thread_ids = self.get_existing_thread_ids()
-    
+        
     def load_config(self, config_file):
         """Load configuration from JSON file"""
         try:
@@ -63,15 +64,32 @@ class F95ZoneCrawler:
         try:
             api_url = self.config['wordpress_api_url'].replace('/create-post', '/existing-threads')
             headers = {'X-API-Key': self.config['wordpress_api_key']}
-            response = requests.get(api_url, headers=headers, timeout=10)
-            if response.status_code == 200:
+
+            # Fetch in pages to avoid very large single responses
+            page_size = int(self.config.get('existing_page_size', 2000))
+            offset = 0
+            thread_ids = set()
+
+            while True:
+                params = {'limit': page_size, 'offset': offset}
+                response = self.session.get(api_url, headers=headers, params=params, timeout=15)
+                if response.status_code != 200:
+                    logger.warning(f"Could not fetch existing thread IDs (status {response.status_code})")
+                    break
+
                 data = response.json()
-                thread_ids = set(data.get('thread_ids', []))
-                logger.info(f"Loaded {len(thread_ids)} existing thread IDs from WordPress")
-                return thread_ids
-            else:
-                logger.warning("Could not fetch existing thread IDs, will rely on API duplicate check")
-                return set()
+                ids = data.get('thread_ids', [])
+                for tid in ids:
+                    thread_ids.add(str(tid))
+
+                # If fewer than page_size returned, we're done
+                if len(ids) < page_size:
+                    break
+
+                offset += page_size
+
+            logger.info(f"Loaded {len(thread_ids)} existing thread IDs from WordPress")
+            return thread_ids
         except Exception as e:
             logger.warning(f"Error fetching existing thread IDs: {e}")
             return set()
@@ -155,9 +173,15 @@ class F95ZoneCrawler:
                 
                 rating_text = item.find('span', class_='ratingStarsRow-text')
                 if rating_text:
-                    count_match = re.search(r'\((\d+)\)', rating_text.text)
+                    count_match = re.search(r'(\d+)', rating_text.text)
                     if count_match:
                         rating_count = int(count_match.group(1))
+                
+                # Extract prefixes (tags)
+                prefixes = []
+                prefix_elems = item.find_all('a', class_='labelLink')
+                for prefix in prefix_elems:
+                    prefixes.append(prefix.text.strip())
                 
                 threads.append({
                     'thread_id': thread_id,
@@ -169,6 +193,7 @@ class F95ZoneCrawler:
                     'views': views,
                     'rating': rating,
                     'rating_count': rating_count,
+                    'prefixes': prefixes
                 })
                 
             except Exception as e:
@@ -176,37 +201,6 @@ class F95ZoneCrawler:
                 continue
         
         return threads
-    
-    def crawl_category(self, max_pages=1):
-        """Crawl category pages to collect thread URLs"""
-        all_threads = []
-        
-        for page_num in range(1, max_pages + 1):
-            if page_num == 1:
-                url = self.category_url
-            else:
-                url = f"{self.category_url}page-{page_num}"
-            
-            logger.info(f"Fetching category page {page_num}: {url}")
-            html = self.fetch_page(url)
-            
-            if not html:
-                logger.warning(f"Failed to fetch category page {page_num}")
-                break
-            
-            threads = self.parse_category_page(html)
-            logger.info(f"Found {len(threads)} threads on page {page_num}")
-            
-            if not threads:
-                logger.info(f"No more threads found, stopping at page {page_num}")
-                break
-            
-            all_threads.extend(threads)
-            
-            # Be respectful to the server
-            time.sleep(self.config.get('delay_between_requests', 2))
-        
-        return all_threads
     
     def parse_thread_page(self, html, thread_data):
         """Parse individual thread page to extract detailed game information"""
@@ -395,22 +389,61 @@ class F95ZoneCrawler:
                 if install_spoiler:
                     game_data['installation'] = install_spoiler.get_text().strip()
             
-            # Extract download links
+            # Extract download links - improved filtering
             download_links = []
-            download_section = content_div.find('b', string=re.compile(r'DOWNLOAD', re.I))
-            if download_section:
-                # Find all links after DOWNLOAD heading
-                parent = download_section.parent
+            
+            # Find DOWNLOAD text (can be in span or b tag)
+            download_markers = content_div.find_all(string=re.compile(r'DOWNLOAD', re.I))
+            
+            if download_markers:
+                # Look for actual download links (common hosting sites)
+                hosting_patterns = [
+                    'mega.nz', 'pixeldrain', 'gofile', 'anonfiles', 'workupload',
+                    'mediafire', 'uploadhaven', 'mixdrop', 'krakenfiles', 'dropbox',
+                    'drive.google', 'nopy.to', 'wetransfer', 'sendspace', 'buzzheavier',
+                    'uploadnow', 'f95zone.to/masked', 'catbox.moe', 'datanodes.to'
+                ]
+                
+                # Get the parent container of the first download marker
+                download_marker = download_markers[0]
+                parent = download_marker.find_parent()
+                
                 while parent and parent.name != 'div':
-                    parent = parent.parent
+                    parent = parent.find_parent()
                 
                 if parent:
-                    for link in parent.find_all('a', class_='link--external'):
+                    # Get text context for finding platform info
+                    parent_text = parent.get_text()
+                    
+                    # Find all links in the download section
+                    for link in parent.find_all('a'):
                         href = link.get('href', '')
-                        text = link.get_text().strip()
-                        if href and text:
+                        
+                        # Check if this link points to a file hosting site
+                        if href and any(host in href.lower() for host in hosting_patterns):
+                            text = link.get_text().strip()
+                            
+                            # Skip empty or very short text
+                            if not text or len(text) < 2:
+                                continue
+                            
+                            # Skip common UI/navigation elements
+                            if text.upper() in ['REACTIONS', 'MEMBERS', 'LOGIN', 'REGISTER', 'FORUMS', 'TAGS']:
+                                continue
+                            
+                            # Try to find platform info nearby
+                            platform = ''
+                            # Check siblings and parents for platform indicators
+                            for sibling in [link.find_previous_sibling(), link.parent]:
+                                if sibling and hasattr(sibling, 'get_text'):
+                                    sib_text = sibling.get_text()
+                                    if 'Win' in sib_text or 'Mac' in sib_text or 'Linux' in sib_text or 'Android' in sib_text:
+                                        platform = sib_text.strip()
+                                        break
+                            
                             download_links.append({
-                                'text': text,
+                                'platform': platform,
+                                'host': text.upper(),
                                 'url': href
                             })
             
@@ -461,64 +494,125 @@ class F95ZoneCrawler:
             logger.error(f"Error parsing thread page: {e}")
             return None
     
-    def send_batch_to_wordpress(self, games_data):
-        """Send multiple game posts to WordPress in a single batch"""
+    def send_to_wordpress(self, game_data):
+        """Send game data to WordPress via REST API"""
+        api_url = self.config['wordpress_api_url']
+        api_key = self.config['wordpress_api_key']
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'X-API-Key': api_key
+        }
+        
         try:
-            api_url = self.config['wordpress_api_url'].replace('/create-post', '/create-batch')
-            headers = {
-                'Content-Type': 'application/json',
-                'X-API-Key': self.config['wordpress_api_key']
-            }
+            response = requests.post(api_url, json=game_data, headers=headers, timeout=30)
+            response.raise_for_status()
             
-            payload = {'posts': games_data}
-            response = requests.post(api_url, json=payload, headers=headers, timeout=30)
+            result = response.json()
+            logger.info(f"Successfully sent: {game_data['title']} - Post ID: {result.get('post_id')}")
             
-            if response.status_code in [200, 201]:
-                data = response.json()
-                created = data.get('created', 0)
-                skipped = data.get('skipped', 0)
-                logger.info(f"Batch sent: {created} created, {skipped} skipped")
-                return True
-            else:
-                logger.error(f"Failed to send batch: {response.status_code} - {response.text}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error sending batch to WordPress: {e}")
-            return False
+            # Add to cache
+            if game_data.get('thread_id'):
+                self.existing_thread_ids.add(game_data['thread_id'])
+            
+            return result
+            
+        except requests.RequestException as e:
+            logger.error(f"Failed to send to WordPress: {e}")
+            if hasattr(e.response, 'text'):
+                logger.error(f"Response: {e.response.text}")
+            return None
+    
+    def send_batch_to_wordpress(self, batch_data):
+        """Send multiple games to WordPress in one request"""
+        api_url = self.config['wordpress_api_url'].replace('/create-post', '/create-batch')
+        api_key = self.config['wordpress_api_key']
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'X-API-Key': api_key
+        }
+        
+        try:
+            response = requests.post(api_url, json={'posts': batch_data}, headers=headers, timeout=60)
+            response.raise_for_status()
+            
+            result = response.json()
+            created = result.get('created', 0)
+            skipped = result.get('skipped', 0)
+            
+            logger.info(f"Batch sent: {created} created, {skipped} skipped")
+            
+            # Add to cache
+            for game in batch_data:
+                if game.get('thread_id'):
+                    self.existing_thread_ids.add(game['thread_id'])
+            
+            return result
+            
+        except requests.RequestException as e:
+            logger.warning(f"Batch send failed, falling back to individual sends: {e}")
+            # Fallback to individual sends
+            success = 0
+            for game_data in batch_data:
+                if self.send_to_wordpress(game_data):
+                    success += 1
+            return {'created': success, 'skipped': 0}
+    
+    def crawl_category(self, max_pages=1, start_page=1):
+        """Crawl category pages and extract thread listings"""
+        all_threads = []
+        
+        for page in range(start_page, start_page + max_pages):
+            page_url = f"{self.category_url}page-{page}" if page > 1 else self.category_url
+            logger.info(f"Fetching category page {page}: {page_url}")
+            
+            html = self.fetch_page(page_url)
+            if not html:
+                logger.warning(f"Skipping page {page} due to fetch error")
+                continue
+            
+            threads = self.parse_category_page(html)
+            logger.info(f"Found {len(threads)} threads on page {page}")
+            all_threads.extend(threads)
+            
+            # Be respectful to the server
+            time.sleep(self.config.get('delay_between_requests', 2))
+        
+        return all_threads
     
     def crawl_threads(self, threads, max_threads=None, batch_size=5):
-        """Crawl individual threads and send in batches"""
-        # Filter out duplicates before processing
-        new_threads = []
+        """Crawl individual thread pages with batch processing"""
+        if max_threads:
+            threads = threads[:max_threads]
+        
+        # Filter out already existing threads
+        threads_to_process = []
+        skipped_count = 0
+        
         for thread in threads:
             if thread['thread_id'] in self.existing_thread_ids:
                 logger.info(f"Skipping duplicate: {thread['title']} (ID: {thread['thread_id']})")
+                skipped_count += 1
             else:
-                new_threads.append(thread)
+                threads_to_process.append(thread)
         
-        logger.info(f"Skipped {len(threads) - len(new_threads)} duplicates, processing {len(new_threads)} new threads")
+        logger.info(f"Skipped {skipped_count} duplicates, processing {len(threads_to_process)} new threads")
         
-        if not new_threads:
-            return 0
-        
-        # Limit number of threads if specified
-        if max_threads:
-            new_threads = new_threads[:max_threads]
-        
-        total = len(new_threads)
+        total = len(threads_to_process)
         success_count = 0
         failed_threads = []
         
         # Process in batches
-        for i in range(0, total, batch_size):
-            batch = new_threads[i:i+batch_size]
-            batch_num = (i // batch_size) + 1
+        for batch_start in range(0, total, batch_size):
+            batch_end = min(batch_start + batch_size, total)
+            batch = threads_to_process[batch_start:batch_end]
+            
+            logger.info(f"Processing batch {batch_start//batch_size + 1} ({batch_start + 1}-{batch_end}/{total})")
+            
             batch_data = []
             
-            logger.info(f"Processing batch {batch_num} ({i+1}-{min(i+batch_size, total)}/{total})")
-            
-            for idx, thread in enumerate(batch, start=i+1):
+            for idx, thread in enumerate(batch, batch_start + 1):
                 logger.info(f"Processing thread {idx}/{total}: {thread['title']}")
                 
                 html = self.fetch_page(thread['thread_url'])
@@ -583,14 +677,15 @@ def main():
     
     parser = argparse.ArgumentParser(description='F95Zone Game Crawler')
     parser.add_argument('--config', default=default_config, help='Config file path')
-    parser.add_argument('--pages', type=int, help='Number of category pages to crawl (default: all pages)')
+    parser.add_argument('--pages', type=int, help='Number of category pages to crawl (default: infinite)')
     parser.add_argument('--max-threads', type=int, help='Maximum number of threads to process (default: all)')
     parser.add_argument('--batch-size', type=int, default=10, help='Batch size for processing (default: 10)')
+    parser.add_argument('--infinite', action='store_true', help='Run continuously, crawling all pages')
     
     args = parser.parse_args()
     
-    # Default to crawling all pages if not specified
-    pages = args.pages if args.pages else 999999
+    # Default to infinite crawling if no pages specified
+    pages = args.pages if args.pages else (999999 if args.infinite or args.pages is None else 1)
     
     crawler = F95ZoneCrawler(config_file=args.config)
     crawler.run(max_pages=pages, max_threads=args.max_threads, batch_size=args.batch_size)
