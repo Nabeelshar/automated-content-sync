@@ -705,6 +705,10 @@ class F95ZoneCrawler:
             threads = self.crawl_category(max_pages=pages_in_batch, start_page=page_start)
             logger.info(f"Found {len(threads)} threads in pages {page_start}-{page_end}")
             
+            # Check if we've reached the last page
+            if hasattr(self, 'detected_last_page') and self.detected_last_page:
+                logger.info(f"Last page detected ({self.detected_last_page}), this will be the final batch")
+            
             if not threads:
                 logger.info(f"No more threads found, stopping at page {page_start}")
                 break
@@ -722,6 +726,11 @@ class F95ZoneCrawler:
             
             logger.info(f"Completed page batch {page_start}-{page_end}: {processed} threads processed")
             logger.info(f"Total threads processed so far: {total_processed}\n")
+            
+            # Stop after processing the batch that contains the last page
+            if hasattr(self, 'detected_last_page') and self.detected_last_page:
+                logger.info(f"Reached last page ({self.detected_last_page}), crawler finished")
+                break
         
         logger.info(f"\n{'='*60}")
         logger.info(f"Crawler completed - Total: {total_processed} threads processed")
