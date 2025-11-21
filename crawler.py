@@ -38,22 +38,21 @@ class F95ZoneCrawler:
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
-        
-        # Add cookies for authentication if provided
-        if 'cookies' in self.config:
-            for cookie in self.config['cookies']:
-                self.session.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain', 'f95zone.to'))
-        
-        # Cache for checking duplicates
-        self.existing_thread_ids = self.get_existing_thread_ids()
     
     def clean_thread_url(self, url):
         """Remove /unread suffix from thread URLs"""
         if url.endswith('/unread'):
             return url[:-7]  # Remove last 7 characters ('/unread')
         return url
+    
+    def setup_session(self):
+        """Setup session with cookies and load existing thread IDs"""
+        # Add cookies for authentication if provided
+        if 'cookies' in self.config:
+            for cookie in self.config['cookies']:
+                self.session.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain', 'f95zone.to'))
         
-        # Cache for checking duplicates
+        # Cache for checking duplicates - single API call
         self.existing_thread_ids = self.get_existing_thread_ids()
         
     def load_config(self, config_file):
@@ -69,33 +68,19 @@ class F95ZoneCrawler:
             sys.exit(1)
     
     def get_existing_thread_ids(self):
-        """Get list of existing thread IDs from WordPress to avoid duplicates"""
+        """Get list of existing thread IDs from WordPress - single lightweight request"""
         try:
             api_url = self.config['wordpress_api_url'].replace('/create-post', '/existing-threads')
             headers = {'X-API-Key': self.config['wordpress_api_key']}
 
-            # Fetch in pages to avoid very large single responses
-            page_size = int(self.config.get('existing_page_size', 2000))
-            offset = 0
-            thread_ids = set()
+            # Single request for just the IDs - much faster
+            response = self.session.get(api_url, headers=headers, params={'ids_only': 'true'}, timeout=30)
+            if response.status_code != 200:
+                logger.warning(f"Could not fetch existing thread IDs (status {response.status_code})")
+                return set()
 
-            while True:
-                params = {'limit': page_size, 'offset': offset}
-                response = self.session.get(api_url, headers=headers, params=params, timeout=15)
-                if response.status_code != 200:
-                    logger.warning(f"Could not fetch existing thread IDs (status {response.status_code})")
-                    break
-
-                data = response.json()
-                ids = data.get('thread_ids', [])
-                for tid in ids:
-                    thread_ids.add(str(tid))
-
-                # If fewer than page_size returned, we're done
-                if len(ids) < page_size:
-                    break
-
-                offset += page_size
+            data = response.json()
+            thread_ids = set(str(tid) for tid in data.get('thread_ids', []))
 
             logger.info(f"Loaded {len(thread_ids)} existing thread IDs from WordPress")
             return thread_ids
@@ -119,12 +104,25 @@ class F95ZoneCrawler:
                     return None
     
     def parse_category_page(self, html):
-        """Parse category page to extract thread links"""
+        """Parse category page to extract thread links and detect last page"""
         soup = BeautifulSoup(html, 'html.parser')
         threads = []
         
         # Thread IDs to always ignore (announcements, rules, etc.)
         IGNORE_THREAD_IDS = {'137266', '50885', '21333'}
+        
+        # Detect the last page number from page navigation
+        # Check the input field's max attribute in the page jump menu
+        last_page = None
+        page_jump_input = soup.find('input', class_='js-pageJumpPage')
+        if page_jump_input:
+            max_attr = page_jump_input.get('max')
+            if max_attr:
+                try:
+                    last_page = int(max_attr)
+                    self.detected_last_page = last_page
+                except ValueError:
+                    pass
         
         # Find all thread items
         thread_items = soup.find_all('div', class_='structItem--thread')
@@ -603,7 +601,14 @@ class F95ZoneCrawler:
             
             threads = self.parse_category_page(html)
             logger.info(f"Found {len(threads)} threads on page {page}")
+            
             all_threads.extend(threads)
+            
+            # Check if we detected the last page from navigation and stop
+            if hasattr(self, 'detected_last_page') and self.detected_last_page:
+                if page >= self.detected_last_page:
+                    logger.info(f"Reached last page ({self.detected_last_page}), stopping crawl")
+                    break
             
             # Be respectful to the server
             time.sleep(self.config.get('delay_between_requests', 2))
@@ -680,6 +685,9 @@ class F95ZoneCrawler:
         logger.info("Starting F95Zone crawler")
         logger.info(f"Crawling {max_pages} category page(s) in batches of {page_batch_size}")
         logger.info(f"Batch processing: {batch_size} threads per batch")
+        
+        # Setup session and load existing IDs in one call
+        self.setup_session()
         
         total_processed = 0
         remaining_threads = max_threads
